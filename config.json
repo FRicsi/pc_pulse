@@ -1,0 +1,15 @@
+{
+  "port": 8765,
+  "watch": [
+    "C:\\",
+    "I:\\",
+    "O:\\",
+    "S:\\"
+  ],
+  "exclude": [],
+  "reads": false,
+  "retentionDays": 14,
+  "maxEvents": 100000,
+  "pollSeconds": 10,
+  "scanSeconds": 900
+}
