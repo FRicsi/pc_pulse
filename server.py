@@ -3,6 +3,7 @@ import calendar
 import ctypes
 import hmac
 import json
+import ntpath
 import os
 import secrets
 import sqlite3
@@ -94,11 +95,11 @@ def beneath(path, root):
 def excluded(path):
     return beneath(path, str(DATA)) or any(beneath(path, p) for p in EXCLUDE)
 
-def folder_size(root):
+def folder_size(root, breakdown=None):
     total, errors = 0, 0
-    pending = [root]
+    pending = [(root, None)]
     while pending and not STOP.is_set():
-        directory = pending.pop()
+        directory, branch = pending.pop()
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
@@ -109,13 +110,22 @@ def folder_size(root):
                         if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
                             continue  # Never follow NTFS junctions/reparse points.
                         if stat.S_ISDIR(info.st_mode):
-                            pending.append(entry.path)
+                            child = branch or entry.path
+                            if breakdown is not None:
+                                breakdown.setdefault(child, [0, 0])
+                            pending.append((entry.path, child))
                         elif stat.S_ISREG(info.st_mode):
                             total += info.st_size
+                            if branch and breakdown is not None:
+                                breakdown[branch][0] += info.st_size
                     except OSError:
                         errors += 1
+                        if branch and breakdown is not None:
+                            breakdown[branch][1] += 1
         except OSError:
             errors += 1
+            if branch and breakdown is not None:
+                breakdown[branch][1] += 1
     return total, errors
 
 def drive_sizes():
@@ -140,18 +150,31 @@ def set_status(**values):
 def scan_once():
     stamp = time.time()
     drives = drive_sizes()
-    rows, warnings = [], []
+    measurements, warnings = {}, []
+    with connect() as con:
+        previous_paths = [r[0] for r in con.execute('SELECT DISTINCT path FROM scans')]
     for path in WATCH:
         if not os.path.isdir(path):
             warnings.append('Nem elérhető mappa: ' + path)
             continue
         set_status(scan='Felmérés: ' + path)
-        size, errors = folder_size(path)
-        rows.append((stamp, path, size, errors))
+        breakdown = {}
+        size, errors = folder_size(path, breakdown)
+        measurements[path] = (stamp, path, size, errors)
+        if not errors and not STOP.is_set():
+            # A removed immediate child is a real zero, not a missing sample.
+            for previous in previous_paths:
+                if (os.path.normcase(os.path.dirname(previous)) == os.path.normcase(os.path.normpath(path))
+                        and not os.path.lexists(previous)):
+                    breakdown.setdefault(previous, [0, 0])
+        for child, (child_size, child_errors) in breakdown.items():
+            measurements[child] = (stamp, child, child_size, child_errors)
         if errors:
             warnings.append(f'{path}: {errors} kihagyott/olvashatatlan elem; részleges méret.')
+    if STOP.is_set():
+        return  # Do not persist a cancelled traversal as a complete measurement.
     with connect() as con:
-        con.executemany('INSERT INTO scans VALUES(?,?,?,?)', rows)
+        con.executemany('INSERT INTO scans VALUES(?,?,?,?)', measurements.values())
         con.executemany('INSERT INTO drives VALUES(?,?,?,?)', [(stamp, *d) for d in drives])
         cutoff = time.time() - max(1, int(CFG.get('retentionDays', 14))) * 86400
         for table in ('scans', 'drives'):
@@ -257,10 +280,8 @@ def filtered_event_rows(*, since, program=None, user=None, path=None, operation=
         clauses.append('operation = ?')
         params.append(operation)
     if path:
-        root = path.replace('\\', '/').rstrip('/')
-        prefix = root + '/%'
-        clauses.append('(LOWER(REPLACE(path, "\\", "/")) = LOWER(?) OR LOWER(REPLACE(path, "\\", "/")) LIKE LOWER(?))')
-        params.extend([root, prefix])
+        clauses.append('INSTR(LOWER(REPLACE(path, CHAR(92), CHAR(47))), LOWER(?)) > 0')
+        params.append(path.replace('\\', '/'))
     sql = 'SELECT time,user,program,path,operation FROM events WHERE ' + ' AND '.join(clauses)
     with connect() as con:
         return con.execute(sql + ' ORDER BY time DESC', params).fetchall()
@@ -284,23 +305,83 @@ def event_chart_data(amount=1, unit='day', *, program=None, user=None, path=None
         buckets[idx]['count'] += 1
     return {'bucketLabel': label, 'buckets': buckets}
 
-def snapshot(amount=1, unit='day', *, program=None, user=None, path=None, operation=None):
+def storage_path(path):
+    return ntpath.normcase(ntpath.normpath(path))
+
+
+def storage_beneath(path, root):
+    try:
+        return ntpath.commonpath([storage_path(path), storage_path(root)]) == storage_path(root)
+    except ValueError:
+        return False
+
+
+def storage_charts(drive_history, scan_rows, drive_paths):
+    """Disjoint logical folder deltas, plus the physical-minus-logical residual.
+
+    A folder stack begins only where all its components have complete samples.
+    Missing or unreadable samples are gaps, never invented zero measurements.
+    """
+    scans = {}
+    for stamp, path, size, errors in scan_rows:
+        scans.setdefault(storage_path(path), {'path': path, 'samples': {}})['samples'][stamp] = (size, errors)
+    charts = {}
+    for drive in drive_paths:
+        rows = [(t, total - free) for t, p, total, free in drive_history if storage_path(p) == storage_path(drive)]
+        rows = sorted(dict(rows).items())
+        candidates = sorted((p for p in scans if p != storage_path(drive) and storage_beneath(p, drive)), key=lambda p: (p.count('\\'), p))
+        # Keep the outermost measured subtrees: parent and child must not be summed.
+        selected = []
+        for p in candidates:
+            if not any(storage_beneath(p, ancestor) for ancestor in selected):
+                selected.append(p)
+        common = [t for t, _ in rows if selected and all(t in scans[p]['samples'] and scans[p]['samples'][t][1] == 0 for p in selected)]
+        # Bound the response while retaining both ends of the interval.
+        if len(rows) > 1000:
+            rows = [rows[round(i * (len(rows) - 1) / 999)] for i in range(1000)]
+        if len(common) > 1000:
+            common = [common[round(i * (len(common) - 1) / 999)] for i in range(1000)]
+        physical = {t: total - free for t, p, total, free in drive_history if storage_path(p) == storage_path(drive)}
+        stack = []
+        if len(common) >= 2:
+            first = common[0]
+            for p in selected:
+                initial = scans[p]['samples'][first][0]
+                stack.append({'path': scans[p]['path'], 'values': [scans[p]['samples'][t][0] - initial for t in common]})
+            residual = [physical[t] - physical[first] - sum(s['values'][i] for s in stack) for i, t in enumerate(common)]
+            stack.append({'path': None, 'values': residual})
+        charts[drive] = {'history': rows, 'times': common if stack else [], 'series': stack,
+                         'totalDelta': [physical[t] - physical[common[0]] for t in common] if stack else [],
+                         'incomplete': any(e for p in selected for _, e in scans[p]['samples'].values())}
+    return charts
+
+
+def snapshot(amount=1, unit='day', *, program=None, user=None, path=None, operation=None, global_user=None):
     since = period_start(amount, unit)
     cutoff = datetime.fromtimestamp(since, timezone.utc).isoformat()
     with connect() as con:
-        event_rows = con.execute('SELECT time,user,program,path,operation FROM events WHERE time >= ? ORDER BY time DESC LIMIT 5000', (cutoff,)).fetchall()
-        count = con.execute('SELECT COUNT(*) FROM events WHERE time >= ?', (cutoff,)).fetchone()[0]
-        program_stats = con.execute("SELECT program,COUNT(*) FROM events WHERE time>=? AND operation='Írás' GROUP BY program ORDER BY COUNT(*) DESC", (cutoff,)).fetchall()
-        users = con.execute('SELECT DISTINCT user FROM events WHERE time >= ? AND user IS NOT NULL ORDER BY user', (cutoff,)).fetchall()
-        identities = con.execute('SELECT COUNT(DISTINCT program),COUNT(DISTINCT user) FROM events WHERE time>=?', (cutoff,)).fetchone()
+        scope = 'time >= ?' + (' AND user = ?' if global_user else '')
+        scope_params = (cutoff, global_user) if global_user else (cutoff,)
+        event_rows = con.execute('SELECT time,user,program,path,operation FROM events WHERE ' + scope + ' ORDER BY time DESC LIMIT 5000', scope_params).fetchall()
+        count = con.execute('SELECT COUNT(*) FROM events WHERE ' + scope, scope_params).fetchone()[0]
+        program_stats = con.execute("SELECT program,COUNT(*) FROM events WHERE " + scope + " AND operation='Írás' GROUP BY program ORDER BY COUNT(*) DESC,program", scope_params).fetchall()
+        users = con.execute('SELECT DISTINCT user FROM events WHERE user IS NOT NULL ORDER BY user').fetchall()
+        programs = con.execute('SELECT DISTINCT program FROM events WHERE ' + scope + ' ORDER BY program', scope_params).fetchall()
+        identities = con.execute('SELECT COUNT(DISTINCT program),COUNT(DISTINCT user) FROM events WHERE ' + scope, scope_params).fetchone()
+        user_paths = [r[0] for r in con.execute('SELECT DISTINCT path FROM events WHERE ' + scope, scope_params)] if global_user else None
         earliest_event = con.execute('SELECT MIN(time) FROM events').fetchone()[0]
         earliest_scan = con.execute('SELECT MIN(time) FROM scans').fetchone()[0]
         drive_rows = con.execute('SELECT path,total,free FROM drives WHERE time=(SELECT MAX(time) FROM drives)').fetchall()
         folders = []
-        for path in WATCH:
-            rows = con.execute('SELECT time,bytes,errors FROM scans WHERE path=? AND time>=? ORDER BY time', (path, since)).fetchall()
+        scan_rows = con.execute('SELECT time,path,bytes,errors FROM scans WHERE time>=? ORDER BY time', (since,)).fetchall()
+        scans_by_path = {}
+        for t, measured_path, size, errors in scan_rows:
+            scans_by_path.setdefault(measured_path, []).append((t, size, errors))
+        for watched_path, rows in sorted(scans_by_path.items()):
+            if user_paths is not None and not any(storage_beneath(p, watched_path) for p in user_paths):
+                continue
             if rows:
-                folders.append({'path': path, 'bytes': rows[-1][1], 'growth': rows[-1][1] - rows[0][1] if len(rows) > 1 else None, 'errors': rows[-1][2], 'samples': len(rows)})
+                folders.append({'path': watched_path, 'bytes': rows[-1][1], 'growth': rows[-1][1] - rows[0][1] if len(rows) > 1 else None, 'errors': rows[-1][2], 'samples': len(rows)})
         # Avoid false growth when a drive appears or disappears between scans.
         drive_history = con.execute('SELECT time,path,total,free FROM drives WHERE time>=? ORDER BY time', (since,)).fetchall()
         grouped = {}
@@ -312,10 +393,11 @@ def snapshot(amount=1, unit='day', *, program=None, user=None, path=None, operat
         # Bound graph payloads even for years of quarter-hour measurements.
         if len(history) > 1000:
             history = [history[round(i * (len(history)-1) / 999)] for i in range(1000)]
-        chart = event_chart_data(amount, unit, program=program, user=user, path=path, operation=operation)
+        storage = storage_charts(drive_history, scan_rows, [p for p, _, _ in drive_rows])
+        chart = event_chart_data(amount, unit, program=program, user=global_user or user, path=path, operation=operation)
     with LOCK:
         status = dict(STATUS)
-    return {'status': status, 'drives': [{'path': p, 'total': t, 'free': f} for p,t,f in drive_rows], 'folders': folders, 'events': [{'time': t,'user': u,'program': p,'path': f,'operation': o} for t,u,p,f,o in event_rows], 'history': history, 'growth': growth, 'eventCount': count, 'config': {'watch': WATCH, 'reads': CFG.get('reads', False), 'retention': CFG.get('retentionDays', 14)}, 'updated': now(), 'period': {'amount': amount, 'unit': unit, 'start': cutoff}, 'available': {'eventsSince': earliest_event, 'scansSince': earliest_scan}, 'programStats': [{'program': p, 'count': n} for p,n in program_stats], 'users': [u[0] for u in users], 'identities': {'programs': identities[0], 'users': identities[1]}, 'chart': chart}
+    return {'status': status, 'drives': [{'path': p, 'total': t, 'free': f} for p,t,f in drive_rows], 'folders': folders, 'events': [{'time': t,'user': u,'program': p,'path': f,'operation': o} for t,u,p,f,o in event_rows], 'history': history, 'growth': growth, 'eventCount': count, 'config': {'watch': WATCH, 'reads': CFG.get('reads', False), 'retention': CFG.get('retentionDays', 14)}, 'updated': now(), 'period': {'amount': amount, 'unit': unit, 'start': cutoff}, 'available': {'eventsSince': earliest_event, 'scansSince': earliest_scan}, 'programStats': [{'program': p, 'count': n} for p,n in program_stats], 'users': [u[0] for u in users], 'identities': {'programs': identities[0], 'users': identities[1]}, 'chart': chart, 'storageCharts': storage, 'programs': [p[0] for p in programs], 'globalUser': global_user}
 
 
 def fetch_events(amount=1, unit='day', *, program=None, user=None, path=None, operation=None):
@@ -385,6 +467,7 @@ class Handler(BaseHTTPRequestHandler):
                     user=query.get('user', [''])[0] or None,
                     path=query.get('path', [''])[0] or None,
                     operation=query.get('operation', [''])[0] or None,
+                    global_user=query.get('globalUser', [''])[0] or None,
                 )
             except (ValueError, OverflowError):
                 self.send_error(400, 'Invalid period')
@@ -434,7 +517,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.settings_origin_is_valid(required=True):
                 self.send_json(403, {'error': 'Érvénytelen Origin.'})
                 return
-            if SETTINGS_PASSWORD == 'WatchDog_Always_Watching_101':
+            if SETTINGS_PASSWORD == 'SET_A_STRONG_PASSWORD_HERE':
                 self.send_json(503, {'error': 'A beállítási jelszó még nincs megadva a backendben.'})
                 return
             if self.headers.get_content_type() != 'application/json':
@@ -449,7 +532,7 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, json.JSONDecodeError):
                 self.send_json(400, {'error': 'Érvénytelen kérés.'})
                 return
-            if not isinstance(password, str) or not hmac.compare_digest(password, SETTINGS_PASSWORD):
+            if not isinstance(password, str) or not hmac.compare_digest(password.encode('utf-8'), SETTINGS_PASSWORD.encode('utf-8')):
                 self.send_json(401, {'error': 'Hibás jelszó.'})
                 return
             token = secrets.token_urlsafe(32)

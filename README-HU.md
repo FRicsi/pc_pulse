@@ -1,5 +1,29 @@
 # PC Pulse 0.3.2 – Windows gyűjtő
 
+## Meghajtó- és mappagrafikon, közös User szűrő
+
+Az Áttekintés tárhelypaneljén egy meghajtóra kattintva csak annak változása látszik.
+A színes, egymásra rakott területek a figyelt, egymást nem átfedő mappák logikai
+méretváltozását mutatják; a csökkenés a nulla alá kerül. A fehér vonal a meghajtó
+tényleges foglalásváltozása. A szürke maradék a fizikai foglalás és a mért logikai
+mappaméretek eltérése, nem egy bizonyítottan azonosított mappa.
+
+A gyűjtő a figyelt gyökerek első szintű almappáit is méri ugyanabban a bejárásban.
+A bontáshoz legalább két közös, teljes mérés szükséges. A régi összesített adatokból
+nem készül visszamenőleges mappabontás; addig a meghajtó összesített trendje látszik.
+Az auditbeállítást ehhez nem kell újrafuttatni.
+
+A fejléc User választója alapból minden domain minden rögzített felhasználóját mutatja.
+A kiválasztás az eseményszámot, programstatisztikákat, eseménygrafikont, táblázatot,
+CSV-exportot és az eseményekben érintett mappák listáját közösen szűri.
+Azonos felhasználónév külön domainben külön érték. A helyi eseményszűrők törlése
+megtartja a főszűrőt. A tárhely- és mappaméretek közös gépmérések: a Windows audit
+nem ad írt bájtszámot, ezért ezek változása nem tulajdonítható egyetlen usernek.
+
+Elkülönített ellenőrzés (az éles adatbázis és audit használata nélkül):
+`python -B -m unittest discover -s tests -v`, majd Windows/Edge alatt
+`python -B tests/browser_dashboard.py`.
+
 Helyi dashboard Firefoxhoz. Python 3.10 vagy újabb szükséges (Windows Python launcher: `py`). Nincs pip-csomag vagy felhő. Ez a csomag nem telepít automatikusan Pythont.
 
 ## Első indítás
