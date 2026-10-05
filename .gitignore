@@ -2,3 +2,5 @@ data/
 __pycache__/
 runtime/
 *.bak
+settings-auth.json
+.pc-pulse-*.tmp

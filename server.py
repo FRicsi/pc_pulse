@@ -449,6 +449,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403)
             return
         url = urlsplit(self.path)
+        if url.path == '/api/runtime':
+            with LOCK:
+                status = dict(STATUS)
+            self.send_json(200, {'root': str(ROOT), 'configPath': str(ROOT / 'config.json'), 'status': status})
+            return
+        if url.path == '/api/control-info':
+            self.send_json(200, {'controlPort': int(CFG.get('controlPort', int(CFG['port']) + 1)),
+                                 'monitorPort': int(CFG['port']), 'isControl': False})
+            return
         if url.path == '/api/settings/config':
             session = self.require_settings_session()
             if (not self.settings_request_is_local() or session is None
@@ -501,7 +510,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
+        control_port = int(CFG.get('controlPort', int(CFG['port']) + 1))
+        self.send_header('Content-Security-Policy', f"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:{control_port} http://localhost:{control_port}; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
 

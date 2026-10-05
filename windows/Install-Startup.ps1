@@ -30,6 +30,15 @@ foreach ($target in @($PythonPath, $dest)) {
 }
 $old = Get-ScheduledTask -TaskName 'PC Pulse' -ErrorAction SilentlyContinue
 if ($old) { Stop-ScheduledTask -TaskName 'PC Pulse'; Start-Sleep -Seconds 2 }
+$oldControl = Get-ScheduledTask -TaskName 'PC Pulse Control' -ErrorAction SilentlyContinue
+if ($oldControl -and $oldControl.State -eq 'Running') {
+  Stop-ScheduledTask -TaskName 'PC Pulse Control'
+  for ($i=0; $i -lt 40; $i++) {
+    if ((Get-ScheduledTask -TaskName 'PC Pulse Control').State -ne 'Running') { break }
+    Start-Sleep -Milliseconds 250
+  }
+  if ((Get-ScheduledTask -TaskName 'PC Pulse Control').State -eq 'Running') { throw 'Control task did not stop.' }
+}
 New-Item -ItemType Directory -Path $dest -Force | Out-Null
 # Protect executable scripts and config before registering an elevated task.
 & icacls.exe $dest /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q
@@ -42,6 +51,8 @@ Get-ChildItem -LiteralPath $dest -Force | ForEach-Object {
 if ($source -ne $dest) {
   Copy-Item -LiteralPath (Join-Path $source 'server.py') -Destination $dest -Force
   Copy-Item -LiteralPath (Join-Path $source 'PC-Pulse.html') -Destination $dest -Force
+  Copy-Item -LiteralPath (Join-Path $source 'control.py') -Destination $dest -Force
+  foreach ($file in @('Start-Background.cmd','Stop-Background.cmd','Restart-Background.cmd','Enable-Autostart.cmd','Disable-Autostart.cmd','Background-Status.cmd')) { Copy-Item -LiteralPath (Join-Path $source $file) -Destination $dest -Force }
   New-Item -ItemType Directory -Path (Join-Path $dest 'windows') -Force | Out-Null
   Copy-Item -Path (Join-Path $source 'windows\*.ps1') -Destination (Join-Path $dest 'windows') -Force
 }
@@ -88,5 +99,6 @@ $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccou
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -StartWhenAvailable
 Register-ScheduledTask -TaskName 'PC Pulse' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName 'PC Pulse'
+& (Join-Path $dest 'windows\Install-Control.ps1')
 Write-Host "Installed. Config: $destConfig"
 Write-Host 'Starts at Windows startup, even before logon. Dashboard: http://127.0.0.1:8765 (or configured port).'

@@ -1,5 +1,47 @@
 # PC Pulse 0.3.2 – Windows gyűjtő
 
+## Beállítások a dashboardból, monitorozás vezérlése
+
+Meglévő telepítésnél egyszer futtasd az **Update-Dashboard.cmd** fájlt
+rendszergazdaként. Ez telepíti az önálló **PC Pulse Control** háttérfeladatot,
+frissíti a felületet és a vezérlőfájlokat. A konfigurációt, adatokat és a már
+beállított vezérlőjelszót megőrzi; **nem futtat auditbeállítást**.
+Ehhez a frissítéshez ne az Install-Background.cmd fájlt használd.
+
+A Beállítások menü első használatakor állíts be legalább 12 karakteres jelszót.
+Ezután két rész érhető el:
+
+1. **Konfiguráció:** a lemezen tárolt config.json aktuális értékei betöltődnek.
+   A meghajtók checkboxokkal választhatók, a további mappák és kihagyások soronként
+   adhatók meg. Az olvasás, megőrzés, eseménykorlát és mérési időközök szerkeszthetők.
+   Mentéskor az előző konfiguráció config.json.bak fájlba kerül. A módosítás
+   újraindítás után érvényes; a Mentés és monitorozás újraindítása gomb ezt is elvégzi.
+2. **Monitorozás / hibaelhárítás:** állapot, javasolt következő lépés, indítás,
+   leállítás, újraindítás, automatikus indulás engedélyezése vagy letiltása.
+   A vezérlő kizárólag a Background-Status, Start-Background, Stop-Background,
+   Restart-Background, Enable-Autostart és Disable-Autostart .cmd fájlokat indítja.
+   Telepítő, audit-script, tetszőleges parancs vagy eltávolítás nem indítható innen.
+
+A vezérlő külön folyamat, ezért a monitorozás leállítása után is elérhető:
+alapból **http://127.0.0.1:8766/**. Ez a cím a teljes felületet is kiszolgálja,
+és a gyűjtőtől lekéri a dashboard adatait. Leállított gyűjtőnél a Beállítások
+továbbra is működik. A szokásos dashboard cím **http://127.0.0.1:8765/** marad.
+Egyedi portnál a vezérlő alapból a monitorport + 1; a config.json `controlPort`
+mezőjével ettől eltérő, külön port is beállítható a telepítés előtt.
+
+A szerkesztés mindig a kijelzett konfigurációs útvonalra vonatkozik.
+SYSTEM alatt a felhasználóhoz csatolt hálózati meghajtók nem feltétlenül érhetők el.
+Új mappa méretmérése működik a konfiguráció alapján; fájleseményeihez meglévő
+Windows-audit szükséges. Az olvasás checkbox nem állítja át a Windows auditját.
+A jelszó sózott scrypt hashként kerül a védett settings-auth.json fájlba.
+Frissítés után a vezérlő újraindulása miatt új bejelentkezés szükséges lehet.
+
+Ellenőrzés: `python -B -m unittest discover -s tests -v`, Windows/Edge alatt
+`python -B tests/browser_dashboard.py` és `python -B tests/browser_settings.py`.
+A beállítási böngészőteszt valódi HTTP- és fájlmentési útvonalat használ ideiglenes
+adatokkal; a Windows indítás/leállítás mellékhatásait helyettesíti. A .cmd indítás
+idézőjelezése külön, csak olvasási állapotlekérdezéssel is ellenőrzött.
+
 ## Meghajtó- és mappagrafikon, közös User szűrő
 
 Az Áttekintés tárhelypaneljén egy meghajtóra kattintva csak annak változása látszik.
@@ -89,7 +131,7 @@ Ez a feladatot törli; az adatok és a Windows auditbeállításai megmaradnak. 
 
 ## Beállítások és adatok
 
-`config.json`: figyelt mappák (`watch`), kihagyott részfák (`exclude`), olvasás (`reads`), megőrzés (`retentionDays`), eseménykorlát (`maxEvents`), időközök, port. Változtatás után indítsd újra a gyűjtőt. Új mappán az audit-scriptet is futtasd újra. A böngészőből ezek csak olvashatók.
+`config.json`: figyelt mappák (`watch`), kihagyott részfák (`exclude`), olvasás (`reads`), megőrzés (`retentionDays`), eseménykorlát (`maxEvents`), időközök, port. Változtatás után indítsd újra a gyűjtőt. Új mappán az audit-scriptet is futtasd újra. A Beállítások menüben jelszavas belépés után szerkeszthetők; a mentés újraindítás után érvényes.
 
 `data\pulse.sqlite`: helyi adatbázis; alapból 14 nap és legfeljebb 100 000 esemény, periodikus törléssel és helyfelszabadítással. Sok hosszú útvonal mellett ez is több tíz/száz MB lehet; nem merev bájtkorlát. A gyűjtő kizárja a saját adatmappáját. Az API csak 127.0.0.1-re köt, nem publikál a hálózatra. A helyi gép böngészőiből a dashboard olvasható.
 
