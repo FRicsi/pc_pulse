@@ -1,13 +1,16 @@
 """PC Pulse local, read-only dashboard. Python 3.10+, standard library only."""
 import calendar
 import ctypes
+import hmac
 import json
 import os
+import secrets
 import sqlite3
 import stat
 import subprocess
 import threading
 import time
+from http.cookies import SimpleCookie
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +18,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 CFG = json.loads((ROOT / 'config.json').read_text(encoding='utf-8-sig'))
+# Set this once in source before enabling the protected settings panel.
+SETTINGS_PASSWORD = 'SET_A_STRONG_PASSWORD_HERE'
+SETTINGS_SESSION_TTL = 15 * 60
+SETTINGS_SESSION_COOKIE = 'pc_pulse_settings'
+SETTINGS_SESSIONS = {}
+SETTINGS_SESSION_LOCK = threading.Lock()
 WATCH = list(dict.fromkeys(os.path.normpath(os.path.expandvars(p)) for p in CFG['watch']))
 EXCLUDE = [os.path.normcase(os.path.normpath(os.path.expandvars(p))) for p in CFG.get('exclude', [])]
 DATA = ROOT / 'data'
@@ -23,6 +32,38 @@ DB = DATA / 'pulse.sqlite'
 STOP = threading.Event()
 LOCK = threading.Lock()
 STATUS = {'audit': 'Indul…', 'scan': 'Indul…', 'lastScan': None, 'lastPoll': None, 'warnings': []}
+
+def settings_config():
+    return {
+        'watch': list(CFG.get('watch', [])),
+        'exclude': list(CFG.get('exclude', [])),
+        'reads': bool(CFG.get('reads', False)),
+        'readWatch': list(CFG.get('readWatch', [])),
+        'retentionDays': CFG.get('retentionDays', 14),
+        'maxEvents': CFG.get('maxEvents', 100000),
+        'pollSeconds': CFG.get('pollSeconds', 10),
+        'scanSeconds': CFG.get('scanSeconds', 900),
+    }
+
+def settings_origin_allowed(origin, port):
+    try:
+        parsed = urlsplit(origin)
+        return (parsed.scheme == 'http' and parsed.path == '' and parsed.query == ''
+                and parsed.fragment == '' and parsed.port == port
+                and parsed.hostname in ('127.0.0.1', 'localhost'))
+    except (TypeError, ValueError):
+        return False
+
+def settings_session(token, *, refresh=False):
+    now_monotonic = time.monotonic()
+    with SETTINGS_SESSION_LOCK:
+        session = SETTINGS_SESSIONS.get(token)
+        if not session or session['expires'] <= now_monotonic:
+            SETTINGS_SESSIONS.pop(token, None)
+            return None
+        if refresh:
+            session['expires'] = now_monotonic + SETTINGS_SESSION_TTL
+        return session
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -192,13 +233,65 @@ def period_start(amount=1, unit='day', end=None):
     month += 1
     return end.replace(year=year, month=month, day=min(end.day, calendar.monthrange(year, month)[1])).timestamp()
 
-def snapshot(amount=1, unit='day'):
+
+def chart_bucket_config(unit):
+    return {
+        'hour': (15 * 60, '15 perc'),
+        'day': (60 * 60, '1 óra'),
+        'week': (6 * 60 * 60, '6 óra'),
+        'month': (24 * 60 * 60, '1 nap'),
+        'year': (30 * 24 * 60 * 60, '1 hónap'),
+    }.get(unit, (60 * 60, '1 óra'))
+
+
+def filtered_event_rows(*, since, program=None, user=None, path=None, operation=None):
+    clauses = ['time >= ?']
+    params = [datetime.fromtimestamp(since, timezone.utc).isoformat()]
+    if program:
+        clauses.append('program = ?')
+        params.append(program)
+    if user:
+        clauses.append('user = ?')
+        params.append(user)
+    if operation:
+        clauses.append('operation = ?')
+        params.append(operation)
+    if path:
+        root = path.replace('\\', '/').rstrip('/')
+        prefix = root + '/%'
+        clauses.append('(LOWER(REPLACE(path, "\\", "/")) = LOWER(?) OR LOWER(REPLACE(path, "\\", "/")) LIKE LOWER(?))')
+        params.extend([root, prefix])
+    sql = 'SELECT time,user,program,path,operation FROM events WHERE ' + ' AND '.join(clauses)
+    with connect() as con:
+        return con.execute(sql + ' ORDER BY time DESC', params).fetchall()
+
+
+def event_chart_data(amount=1, unit='day', *, program=None, user=None, path=None, operation=None):
+    since = period_start(amount, unit)
+    step, label = chart_bucket_config(unit)
+    end = datetime.now(timezone.utc).timestamp()
+    buckets = []
+    size = max(1, int((end - since) // step) + 1)
+    for i in range(size):
+        start = since + i * step
+        buckets.append({'start': start, 'end': min(start + step, end), 'count': 0})
+    rows = filtered_event_rows(since=since, program=program, user=user, path=path, operation=operation)
+    for stamp, *_ in rows:
+        event_time = datetime.fromisoformat(stamp).timestamp()
+        if event_time < since or event_time >= end:
+            continue
+        idx = min(max(int((event_time - since) // step), 0), len(buckets) - 1)
+        buckets[idx]['count'] += 1
+    return {'bucketLabel': label, 'buckets': buckets}
+
+def snapshot(amount=1, unit='day', *, program=None, user=None, path=None, operation=None):
     since = period_start(amount, unit)
     cutoff = datetime.fromtimestamp(since, timezone.utc).isoformat()
     with connect() as con:
         event_rows = con.execute('SELECT time,user,program,path,operation FROM events WHERE time >= ? ORDER BY time DESC LIMIT 5000', (cutoff,)).fetchall()
         count = con.execute('SELECT COUNT(*) FROM events WHERE time >= ?', (cutoff,)).fetchone()[0]
         program_stats = con.execute("SELECT program,COUNT(*) FROM events WHERE time>=? AND operation='Írás' GROUP BY program ORDER BY COUNT(*) DESC", (cutoff,)).fetchall()
+        users = con.execute('SELECT DISTINCT user FROM events WHERE time >= ? AND user IS NOT NULL ORDER BY user', (cutoff,)).fetchall()
         identities = con.execute('SELECT COUNT(DISTINCT program),COUNT(DISTINCT user) FROM events WHERE time>=?', (cutoff,)).fetchone()
         earliest_event = con.execute('SELECT MIN(time) FROM events').fetchone()[0]
         earliest_scan = con.execute('SELECT MIN(time) FROM scans').fetchone()[0]
@@ -219,46 +312,80 @@ def snapshot(amount=1, unit='day'):
         # Bound graph payloads even for years of quarter-hour measurements.
         if len(history) > 1000:
             history = [history[round(i * (len(history)-1) / 999)] for i in range(1000)]
+        chart = event_chart_data(amount, unit, program=program, user=user, path=path, operation=operation)
     with LOCK:
         status = dict(STATUS)
-    return {'status': status, 'drives': [{'path': p, 'total': t, 'free': f} for p,t,f in drive_rows], 'folders': folders, 'events': [{'time': t,'user': u,'program': p,'path': f,'operation': o} for t,u,p,f,o in event_rows], 'history': history, 'growth': growth, 'eventCount': count, 'config': {'watch': WATCH, 'reads': CFG.get('reads', False), 'retention': CFG.get('retentionDays', 14)}, 'updated': now(), 'period': {'amount': amount, 'unit': unit, 'start': cutoff}, 'available': {'eventsSince': earliest_event, 'scansSince': earliest_scan}, 'programStats': [{'program': p, 'count': n} for p,n in program_stats], 'identities': {'programs': identities[0], 'users': identities[1]}}
+    return {'status': status, 'drives': [{'path': p, 'total': t, 'free': f} for p,t,f in drive_rows], 'folders': folders, 'events': [{'time': t,'user': u,'program': p,'path': f,'operation': o} for t,u,p,f,o in event_rows], 'history': history, 'growth': growth, 'eventCount': count, 'config': {'watch': WATCH, 'reads': CFG.get('reads', False), 'retention': CFG.get('retentionDays', 14)}, 'updated': now(), 'period': {'amount': amount, 'unit': unit, 'start': cutoff}, 'available': {'eventsSince': earliest_event, 'scansSince': earliest_scan}, 'programStats': [{'program': p, 'count': n} for p,n in program_stats], 'users': [u[0] for u in users], 'identities': {'programs': identities[0], 'users': identities[1]}, 'chart': chart}
 
 
 def fetch_events(amount=1, unit='day', *, program=None, user=None, path=None, operation=None):
     since = period_start(amount, unit)
-    cutoff = datetime.fromtimestamp(since, timezone.utc).isoformat()
-    with connect() as con:
-        rows = con.execute(
-            'SELECT time,user,program,path,operation FROM events WHERE time >= ? ORDER BY time DESC',
-            (cutoff,),
-        ).fetchall()
-    selected = []
-    for time_value, user_name, program_name, event_path, event_operation in rows:
-        if program and program_name != program:
-            continue
-        if user and user_name != user:
-            continue
-        if operation and event_operation != operation:
-            continue
-        if path:
-            match_path = os.path.normcase(os.path.normpath(event_path))
-            root = os.path.normcase(os.path.normpath(path))
-            if match_path != root and not beneath(match_path, root):
-                continue
-        selected.append({'time': time_value, 'user': user_name, 'program': program_name, 'path': event_path, 'operation': event_operation})
-    return selected
+    rows = filtered_event_rows(since=since, program=program, user=user, path=path, operation=operation)[:5000]
+    return [{'time': t, 'user': u, 'program': p, 'path': f, 'operation': o} for t, u, p, f, o in rows]
 
 
 class Handler(BaseHTTPRequestHandler):
+    def send_json(self, status, payload, headers=None):
+        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        if headers:
+            for name, value in headers.items():
+                self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def settings_request_is_local(self):
+        return self.client_address[0] in ('127.0.0.1', '::1')
+
+    def settings_origin_is_valid(self, *, required=False):
+        origin = self.headers.get('Origin')
+        if origin is None:
+            return not required
+        return settings_origin_allowed(origin, int(CFG['port']))
+
+    def settings_cookie_token(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get('Cookie', ''))
+        except Exception:
+            return None
+        morsel = cookie.get(SETTINGS_SESSION_COOKIE)
+        return morsel.value if morsel else None
+
+    def require_settings_session(self):
+        token = self.settings_cookie_token()
+        if not token:
+            return None
+        return settings_session(token, refresh=True)
+
     def do_GET(self):
         if self.headers.get('Host') not in (f'127.0.0.1:{CFG["port"]}', f'localhost:{CFG["port"]}'):
             self.send_error(403)
             return
         url = urlsplit(self.path)
+        if url.path == '/api/settings/config':
+            session = self.require_settings_session()
+            if (not self.settings_request_is_local() or session is None
+                    or not self.settings_origin_is_valid()):
+                self.send_json(403, {'error': 'Hitelesítés szükséges.'})
+                return
+            self.send_json(200, {'config': settings_config()})
+            return
         if url.path == '/api/snapshot':
             query = parse_qs(url.query)
             try:
-                payload = snapshot(int(query.get('amount', ['1'])[0]), query.get('unit', ['day'])[0])
+                payload = snapshot(
+                    int(query.get('amount', ['1'])[0]),
+                    query.get('unit', ['day'])[0],
+                    program=query.get('program', [''])[0] or None,
+                    user=query.get('user', [''])[0] or None,
+                    path=query.get('path', [''])[0] or None,
+                    operation=query.get('operation', [''])[0] or None,
+                )
             except (ValueError, OverflowError):
                 self.send_error(400, 'Invalid period')
                 return
@@ -294,6 +421,65 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        if self.headers.get('Host') not in (f'127.0.0.1:{CFG["port"]}', f'localhost:{CFG["port"]}'):
+            self.send_error(403)
+            return
+        if not self.settings_request_is_local():
+            self.send_json(403, {'error': 'Csak helyi kérés engedélyezett.'})
+            return
+        url = urlsplit(self.path)
+        if url.path == '/api/settings/login':
+            if not self.settings_origin_is_valid(required=True):
+                self.send_json(403, {'error': 'Érvénytelen Origin.'})
+                return
+            if SETTINGS_PASSWORD == 'WatchDog_Always_Watching_101':
+                self.send_json(503, {'error': 'A beállítási jelszó még nincs megadva a backendben.'})
+                return
+            if self.headers.get_content_type() != 'application/json':
+                self.send_json(415, {'error': 'JSON kérés szükséges.'})
+                return
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 4096:
+                    raise ValueError
+                payload = json.loads(self.rfile.read(length))
+                password = payload.get('password') if isinstance(payload, dict) else None
+            except (ValueError, json.JSONDecodeError):
+                self.send_json(400, {'error': 'Érvénytelen kérés.'})
+                return
+            if not isinstance(password, str) or not hmac.compare_digest(password, SETTINGS_PASSWORD):
+                self.send_json(401, {'error': 'Hibás jelszó.'})
+                return
+            token = secrets.token_urlsafe(32)
+            csrf_token = secrets.token_urlsafe(32)
+            with SETTINGS_SESSION_LOCK:
+                SETTINGS_SESSIONS[token] = {
+                    'csrf': csrf_token,
+                    'expires': time.monotonic() + SETTINGS_SESSION_TTL,
+                }
+            self.send_json(200, {'csrfToken': csrf_token, 'expiresIn': SETTINGS_SESSION_TTL}, {
+                'Set-Cookie': f'{SETTINGS_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SETTINGS_SESSION_TTL}',
+            })
+            return
+        if url.path == '/api/settings/logout':
+            if not self.settings_origin_is_valid(required=True):
+                self.send_json(403, {'error': 'Érvénytelen Origin.'})
+                return
+            session = self.require_settings_session()
+            csrf = self.headers.get('X-CSRF-Token', '')
+            if session is None or not hmac.compare_digest(csrf, session['csrf']):
+                self.send_json(403, {'error': 'A munkamenet vagy a CSRF-token érvénytelen.'})
+                return
+            token = self.settings_cookie_token()
+            with SETTINGS_SESSION_LOCK:
+                SETTINGS_SESSIONS.pop(token, None)
+            self.send_json(200, {'ok': True}, {
+                'Set-Cookie': f'{SETTINGS_SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
+            })
+            return
+        self.send_json(404, {'error': 'Nincs ilyen végpont.'})
 
     def log_message(self, *_):
         pass
