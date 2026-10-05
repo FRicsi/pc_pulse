@@ -223,6 +223,32 @@ def snapshot(amount=1, unit='day'):
         status = dict(STATUS)
     return {'status': status, 'drives': [{'path': p, 'total': t, 'free': f} for p,t,f in drive_rows], 'folders': folders, 'events': [{'time': t,'user': u,'program': p,'path': f,'operation': o} for t,u,p,f,o in event_rows], 'history': history, 'growth': growth, 'eventCount': count, 'config': {'watch': WATCH, 'reads': CFG.get('reads', False), 'retention': CFG.get('retentionDays', 14)}, 'updated': now(), 'period': {'amount': amount, 'unit': unit, 'start': cutoff}, 'available': {'eventsSince': earliest_event, 'scansSince': earliest_scan}, 'programStats': [{'program': p, 'count': n} for p,n in program_stats], 'identities': {'programs': identities[0], 'users': identities[1]}}
 
+
+def fetch_events(amount=1, unit='day', *, program=None, user=None, path=None, operation=None):
+    since = period_start(amount, unit)
+    cutoff = datetime.fromtimestamp(since, timezone.utc).isoformat()
+    with connect() as con:
+        rows = con.execute(
+            'SELECT time,user,program,path,operation FROM events WHERE time >= ? ORDER BY time DESC',
+            (cutoff,),
+        ).fetchall()
+    selected = []
+    for time_value, user_name, program_name, event_path, event_operation in rows:
+        if program and program_name != program:
+            continue
+        if user and user_name != user:
+            continue
+        if operation and event_operation != operation:
+            continue
+        if path:
+            match_path = os.path.normcase(os.path.normpath(event_path))
+            root = os.path.normcase(os.path.normpath(path))
+            if match_path != root and not beneath(match_path, root):
+                continue
+        selected.append({'time': time_value, 'user': user_name, 'program': program_name, 'path': event_path, 'operation': event_operation})
+    return selected
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.headers.get('Host') not in (f'127.0.0.1:{CFG["port"]}', f'localhost:{CFG["port"]}'):
@@ -233,6 +259,22 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(url.query)
             try:
                 payload = snapshot(int(query.get('amount', ['1'])[0]), query.get('unit', ['day'])[0])
+            except (ValueError, OverflowError):
+                self.send_error(400, 'Invalid period')
+                return
+            body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            mime = 'application/json; charset=utf-8'
+        elif url.path == '/api/events':
+            query = parse_qs(url.query)
+            try:
+                payload = fetch_events(
+                    int(query.get('amount', ['1'])[0]),
+                    query.get('unit', ['day'])[0],
+                    program=query.get('program', [''])[0] or None,
+                    user=query.get('user', [''])[0] or None,
+                    path=query.get('path', [''])[0] or None,
+                    operation=query.get('operation', [''])[0] or None,
+                )
             except (ValueError, OverflowError):
                 self.send_error(400, 'Invalid period')
                 return
